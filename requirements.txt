@@ -1,0 +1,7 @@
+brotli>=1.1.0
+pandas>=1.4.1,<=2.2.3
+requests>=2.28.0
+streamtologger>=2017.1
+tksheet>=5.3.2,<=6.3.5
+win10toast>=0.9; platform_system == "Windows" and platform_release == "10"
+psycopg2>=2.9

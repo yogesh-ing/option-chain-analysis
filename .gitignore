@@ -1,0 +1,17 @@
+# Generated / runtime files
+option_chain_live.html
+.NSE-OCA.ini
+NSE-OCA.ini
+NSE-OCA.log
+.NSE-OCA.png
+.NSE-OCA.ico
+__pycache__/
+*.pyc
+
+# Exported data (regenerable from Postgres)
+NSE-OCA-*.csv
+*.csv
+
+# OS junk
+Thumbs.db
+.DS_Store
