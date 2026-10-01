@@ -1,9 +1,11 @@
 """Synthetic end-to-end test of the strategy engine against local Postgres.
 
 Uses symbol TESTNIFTY so real data is untouched; cleans up after itself.
-Covers: S1 + S3 + S4 firing and opening paper trades, cooldown suppression,
-MTM update, TARGET exit on a debit spread, WALL REJECTED exit, closed-market
-static payload, and dashboard rendering.
+Covers: execution gates (warm-up, persistence, market-hours), S1 + S3 + S4
+firing and opening paper trades, risk sizing, cooldown suppression, MTM
+update, TARGET exit on a debit spread, WALL REJECTED exit, after-hours
+suppression, closed-market static payload, and dashboard rendering with
+trades embedded in their owning strategy cards.
 """
 import datetime
 import math
@@ -75,9 +77,12 @@ def run(name, cond):
 
 
 run.failed = False
+NOW0 = datetime.datetime(2026, 10, 1, 14, 20)    # warm-up scan 1
+NOW0B = datetime.datetime(2026, 10, 1, 14, 22)   # warm-up scan 2
 NOW1 = datetime.datetime(2026, 10, 1, 14, 30)
 NOW2 = datetime.datetime(2026, 10, 1, 14, 35)
 NOW3 = datetime.datetime(2026, 10, 1, 14, 40)
+NOWLATE = datetime.datetime(2026, 10, 1, 20, 0)  # after hours — no entries
 
 
 def cleanup():
@@ -102,9 +107,19 @@ def main():
     strategies.ensure_schema()
     cleanup()
 
-    # ---------------- cycle 1: signals fire, trades open ----------------
+    # -------- warm-up + persistence gates: 2 hot scans, NO entries --------
     ltps, vols, ois, chg_oi, ivs, deltas = base_snapshot()
     args1 = snap_args(SPOT, ltps, vols, ois, chg_oi, ivs, deltas)
+    p0 = strategies.run_cycle(SYMBOL, EXPIRY, SPOT, args1, NOW0, vix=None,
+                              t_years=29 / 365)
+    run("warm-up scan 1: hot data but no signals/trades",
+        not p0["new_signals"] and not p0["open_trades"])
+    p0b = strategies.run_cycle(SYMBOL, EXPIRY, SPOT, args1, NOW0B, vix=None,
+                               t_years=29 / 365)
+    run("warm-up scan 2: still no entries (WARMUP_CYCLES gate)",
+        not p0b["new_signals"] and not p0b["open_trades"])
+
+    # ------------- cycle 1 (3rd hot scan): signals fire, trades open ------
     p1 = strategies.run_cycle(SYMBOL, EXPIRY, SPOT, args1, NOW1, vix=None,
                               t_years=29 / 365)
     fired = {g["strategy"] for g in p1["new_signals"]}
@@ -115,6 +130,12 @@ def main():
     run("3 paper trades opened", len(p1["open_trades"]) == 3)
     run("trades risk-sized with lots >= 1",
         all(t["qty"] >= 1 for t in p1["open_trades"]))
+    run("each debit trade risks <= 2% of account",
+        all(t["qty"] * t["lot"] * max(t["cost"], 0.0) <= 20001
+            for t in p1["open_trades"]))
+    run("total open worst-case risk within heat cap",
+        p1["summary"]["open_risk"] <= strategies.PAPER_ACCOUNT
+        * strategies.MAX_TOTAL_HEAT + 1)
     s1t = next(t for t in p1["open_trades"] if t["strategy"] == "S1")
     run("S1 = bull call spread at the anomaly strike (24,650)",
         "24,650" in s1t["structure"] and "Bull Call" in s1t["structure"])
@@ -125,6 +146,10 @@ def main():
     run("dashboard renders cards + open trades",
         "Quant Strategy Dashboard" in html and "Open paper trades" in html
         and "Bull Call Spread" in html)
+    run("trades embedded in their owning strategy cards",
+        "S1 trades:" in html and "S3 trades:" in html and "S4 trades:" in html)
+    run("strategy identifiers named, not just codes",
+        "S1 — Unusual OI + Volume" in html and "S4 — Put Skew (Fade)" in html)
 
     # ---------------- cycle 2: MTM, TARGET exit, cooldown ----------------
     ltps[24650] = (130.0, 8.0)     # conviction leg repriced up
@@ -155,6 +180,13 @@ def main():
     s3_closed = [t for t in p3["closed_trades"] if t["strategy"] == "S3"]
     run("S3 closes on WALL REJECTED when spot pulls back 0.5% from entry",
         s3_closed and s3_closed[0]["reason"] == "WALL REJECTED")
+
+    # ------------- after hours: hot data at 20:00 must NOT enter ----------
+    # (EOD rule closes any remaining open trades; no new signals recorded)
+    pl = strategies.run_cycle(SYMBOL, EXPIRY, SPOT, args1, NOWLATE, vix=None,
+                              t_years=29 / 365)
+    run("no new signals outside 9:15-15:30 session", not pl["new_signals"])
+    run("after-hours cycle leaves no open trades", not pl["open_trades"])
 
     # ---------------- closed-market payload ----------------
     st = strategies.static_payload(SYMBOL, spot=24300.0)

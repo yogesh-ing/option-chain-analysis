@@ -46,7 +46,8 @@ S1_IV_GATE = 1.25               # S1: skip if strike IV > 1.25x ATM IV (rich pre
 IV_ZSCORE = 2.0                 # S2: strike IV z-score trigger
 IV_ZSCORE_MIN_PTS = 12          # S2: min samples in a series to trust z
 VIX_SELL_LEVEL = 20.0           # S2: VIX >= this = elevated regime
-ATM_IV_SELL_LEVEL = 13.5        # S2 fallback gauge when VIX is unavailable
+ATM_IV_SELL_LEVEL = 15.0        # S2 fallback gauge when VIX is unavailable
+                                # (15% NIFTY ATM IV = genuine fear zone)
 GEX_WALL_PCT = 1.0              # S3: spot within 1% of gamma wall
 GEX_WALL_VOL_MULT = 2.0         # S3: wall-strike volume building (2x median)
 SKEW_PREMIUM = 10.0             # S4: OTM-put IV minus ATM IV > 10 pts = anomaly
@@ -55,9 +56,35 @@ COOLDOWN_MIN = 60               # minutes before same signal key can re-fire
 SIGNALS_PER_DAY_CAP = 3         # per strategy key, hard cap
 TIME_EXIT = datetime.time(15, 28)
 
+# ---- execution guards ----
+TRADE_START = datetime.time(9, 15)    # entries ONLY inside active F&O session
+TRADE_END = datetime.time(15, 30)     # no new entries after 15:30
+WARMUP_CYCLES = 2                     # first scans after start: scan only, no trades
+PERSIST_SCANS = 2                     # signal must be hot across N consecutive scans
+MAX_TOTAL_HEAT = 0.06                 # sum of open max-loss <= 6% of account
+
 _schema_done = False
 _cache = {"hist": {}, "hist_at": 0.0, "vix": None, "vix_at": 0.0}
 _cache_lock = threading.Lock()
+_scan_count = {}      # symbol -> cycles since process start (warm-up)
+_hot_streak = {}      # (symbol, strategy, skey) -> consecutive hot scans
+
+
+def in_trading_session(now):
+    """True only inside the active F&O session: Mon-Fri 09:15-15:30 IST.
+    No signals are recorded and no trades are opened outside this window."""
+    return (now.weekday() < 5
+            and TRADE_START <= now.time() <= TRADE_END)
+
+
+def _bump(symbol, strategy, skey, hot):
+    """Track consecutive hot scans for persistence gating."""
+    key = (symbol, strategy, skey)
+    if not hot:
+        _hot_streak[key] = 0
+        return 0
+    _hot_streak[key] = _hot_streak.get(key, 0) + 1
+    return _hot_streak[key]
 
 
 def configure(dsn=None, snap_table=None, account=None):
@@ -350,14 +377,41 @@ def open_trade(symbol, strategy, signal_id, direction, structure, legs, meta, no
                 return None, f"leg {side} {k:.0f} unpriced — trade skipped"
             cost += ltp if action == "buy" else -ltp
             priced.append({"strike": k, "side": side, "action": action, "entry": ltp})
-        # max loss per lot (premium/width already × lot multiplier below)
+        # max loss per lot: debit spread pays full premium; credit spread
+        # risks wing width minus credit
         if cost > 0:
             max_loss = cost
         else:
             width = max(l["strike"] for l in priced) - min(l["strike"] for l in priced)
             max_loss = max(width - abs(cost), 0.5)
-        lots = max(1, min(MAX_LOTS, int((PAPER_ACCOUNT * RISK_PER_TRADE)
-                                        // (max_loss * lot))))
+        lots = max(1, min(MAX_LOTS,
+                          int((PAPER_ACCOUNT * RISK_PER_TRADE) // (max_loss * lot))))
+        # execution guards: no opposing bets on the same symbol, and the
+        # summed worst-case loss across open positions stays under cap
+        opp = {"bullish": "bearish", "bearish": "bullish"}.get(direction)
+        if opp:
+            cur.execute("""SELECT count(*) FROM paper_trades
+                           WHERE symbol=%s AND status='open' AND direction=%s""",
+                        (symbol, opp))
+            if cur.fetchone()[0]:
+                return None, f"opposite-direction position already open — skipped"
+        cur.execute("""SELECT legs, qty, lot, net_cost FROM paper_trades
+                       WHERE symbol=%s AND status='open'""", (symbol,))
+        heat = 0.0
+        for (lgs, q, lt, nc) in cur.fetchall():
+            lgs = lgs if isinstance(lgs, list) else json.loads(lgs)
+            nc = float(nc)
+            if nc > 0:
+                ml = nc
+            else:
+                w = (max(l["strike"] for l in lgs) - min(l["strike"] for l in lgs)
+                     if len(lgs) > 1 else 0)
+                ml = max(w - abs(nc), 0.5)
+            heat += ml * q * lt
+        new_heat = heat + max_loss * lots * lot
+        if new_heat > PAPER_ACCOUNT * MAX_TOTAL_HEAT:
+            return None, (f"total open risk \u20b9{new_heat:,.0f} would exceed "
+                          f"{MAX_TOTAL_HEAT * 100:.0f}% cap — skipped")
         cur.execute("""INSERT INTO paper_trades
             (symbol, strategy, signal_id, direction, structure, legs, qty, lot,
              net_cost, entry_at, mtm_cost, u_pnl, status, meta)
@@ -636,10 +690,38 @@ def run_cycle(symbol, expiry, spot, db_args, now, vix=None, t_years=None):
     s3, s3_note, s3_metrics = scan_s3(rows, spot, atm_row, now)
     s4, s4_note, s4_metrics = scan_s4(rows, spot, atm_row, series, now)
 
+    # ---- execution gates: entries ONLY inside the live F&O session, only
+    # after process warm-up, and only when the signal stays hot across
+    # PERSIST_SCANS consecutive scans (kills one-tick flukes).
+    _scan_count[symbol] = _scan_count.get(symbol, 0) + 1
+    tradable = (in_trading_session(now)
+                and _scan_count[symbol] > WARMUP_CYCLES)
+
+    def streak_for(strategy, skey, hot):
+        """Consecutive-hot count for this signal key; a cold scan wipes the
+        strategy's streaks for the symbol."""
+        if not hot or not skey:
+            for key in list(_hot_streak):
+                if key[0] == symbol and key[1] == strategy:
+                    _hot_streak[key] = 0
+            return 0
+        return _bump(symbol, strategy, skey, True)
+
+    s1_key = f"{s1['dir']}:{s1['strike']:.0f}" if s1 else None
+    s2_key = "condor" if s2 else None
+    s3_key = f"wall:{s3['strike']:.0f}" if s3 else None
+    s4_key = f"skew:{s4['mode']}:{s4['strike']:.0f}" if s4 else None
+    s1_streak = streak_for("S1", s1_key, s1)
+    s2_streak = streak_for("S2", s2_key, s2)
+    s3_streak = streak_for("S3", s3_key, s3)
+    s4_streak = streak_for("S4", s4_key, s4)
+
     if s1:
         k = s1["strike"]
-        skey = f"{s1['dir']}:{k:.0f}"
-        if not recent_fires(symbol, "S1", skey, COOLDOWN_MIN, SIGNALS_PER_DAY_CAP):
+        skey = s1_key
+        if (tradable and s1_streak >= PERSIST_SCANS
+                and not recent_fires(symbol, "S1", skey, COOLDOWN_MIN,
+                                     SIGNALS_PER_DAY_CAP)):
             detail = s1_note
             sig_id = record_signal(symbol, "S1", skey, s1["dir"], k, detail, s1, True)
             if s1["dir"] == "bullish":
@@ -658,8 +740,9 @@ def run_cycle(symbol, expiry, spot, db_args, now, vix=None, t_years=None):
                 print("S1 trade rejected:", why)
             signals.append({"strategy": "S1", "detail": detail, "traded": bool(tid)})
     if s2:
-        skey = "condor"
-        if not recent_fires(symbol, "S2", skey, 240, 1):
+        skey = s2_key
+        if (tradable and s2_streak >= PERSIST_SCANS
+                and not recent_fires(symbol, "S2", skey, 240, 1)):
             sd = spot * (atm_iv / 100.0) * math.sqrt(t_years)
             sc = _round_strike(spot + sd, step)
             sp_ = _round_strike(spot - sd, step)
@@ -679,8 +762,10 @@ def run_cycle(symbol, expiry, spot, db_args, now, vix=None, t_years=None):
             signals.append({"strategy": "S2", "detail": detail, "traded": bool(tid)})
     if s3:
         k = s3["strike"]
-        skey = f"wall:{k:.0f}"
-        if not recent_fires(symbol, "S3", skey, COOLDOWN_MIN, SIGNALS_PER_DAY_CAP):
+        skey = s3_key
+        if (tradable and s3_streak >= PERSIST_SCANS
+                and not recent_fires(symbol, "S3", skey, COOLDOWN_MIN,
+                                     SIGNALS_PER_DAY_CAP)):
             atm_k = atm_row["strike"]
             sell_k = _round_strike(atm_k + 2 * step, step)
             detail = s3_note
@@ -696,8 +781,10 @@ def run_cycle(symbol, expiry, spot, db_args, now, vix=None, t_years=None):
     if s4:
         k = s4["strike"]
         mode = s4["mode"]
-        skey = f"skew:{mode}:{k:.0f}"
-        if not recent_fires(symbol, "S4", skey, COOLDOWN_MIN, SIGNALS_PER_DAY_CAP):
+        skey = s4_key
+        if (tradable and s4_streak >= PERSIST_SCANS
+                and not recent_fires(symbol, "S4", skey, COOLDOWN_MIN,
+                                     SIGNALS_PER_DAY_CAP)):
             strat = "S4_FOLLOW" if mode == "follow" else "S4_FADE"
             detail = s4_note
             sig_id = record_signal(symbol, "S4", skey,
@@ -797,6 +884,19 @@ CARD_COLORS = {"IDLE": ("#eceff1", "#455a64"), "ARMED": ("#fff3e0", "#e65100"),
                "TRIGGERED — FOLLOW": ("#e3f2fd", "#0d47a1"),
                "TRIGGERED — FADE": ("#e8f5e9", "#1b5e20")}
 
+# Human-readable identifier for every strategy / variant code stored on a
+# trade or signal — shown on cards, tables and embedded trade rows.
+STRAT_NAMES = {"S1": "S1 — Unusual OI + Volume",
+               "S2": "S2 — IV Spike / Sell Premium",
+               "S3": "S3 — Gamma Wall",
+               "S4": "S4 — Put Skew",
+               "S4_FOLLOW": "S4 — Put Skew (Follow)",
+               "S4_FADE": "S4 — Put Skew (Fade)"}
+
+
+def strat_label(code):
+    return STRAT_NAMES.get(code, code or "?")
+
 
 def render_dashboard(p):
     if not p:
@@ -820,18 +920,36 @@ Quant Strategy Dashboard — Automated Paper Trades</h2>"""]
                 f'{_inr(s["realized_today"], signed=True)}</b></span>'
                 f'<span>Open risk {_inr(s["open_risk"])}</span>'
                 f'<span>Open trades {len(p["open_trades"])}</span></div>')
-    # strategy cards
+    # strategy cards — each card shows the paper trades it owns
+    def card_key(strat_code):
+        return (strat_code or "").split("_")[0]
+
+    def trade_line(t, closed=False):
+        cls = "sd-pos" if t["pnl"] >= 0 else "sd-neg"
+        tail = (f'closed {t.get("when", "")} · {t.get("reason") or "exit"}'
+                if closed else f'entered {t["entry"]} · lots {t["qty"]}')
+        return (f'<div class="sd-tt"><b>#{t["id"]}</b> {t["direction"] or "-"} · '
+                f'{t["structure"]} <span class="sd-tt-sub">({tail})</span> '
+                f'<b class="{cls}">{_inr(t["pnl"], signed=True)}</b></div>')
+
     html.append('<div class="sd-grid">')
     for c in p["cards"]:
         bg, fg = CARD_COLORS.get(c["status"], CARD_COLORS["IDLE"])
         rows = "".join(f'<div class="sd-kv"><span>{k}</span><b>{v}</b></div>'
                        for k, v in c["metrics"])
+        mine = [t for t in p["open_trades"] if card_key(t["strategy"]) == c["id"]]
+        done = [t for t in p["closed_trades"] if card_key(t["strategy"]) == c["id"]]
+        tt = "".join(trade_line(t) for t in mine)
+        tt += "".join(trade_line(t, closed=True) for t in done[:2])
+        owns = (f'<div class="sd-owns"><i>{c["id"]} trades:</i>{tt}</div>'
+                if tt else "")
         html.append(
             f'<div class="sd-card" style="background:{bg};border-color:{fg};">'
             f'<div class="sd-card-h"><b>{c["name"]}</b>'
             f'<span class="sd-badge" style="background:{fg}">{c["status"]}</span></div>'
             f'{rows}'
             f'<div class="sd-note">{c["note"] or "no anomaly yet"}</div>'
+            f'{owns}'
             f'<div class="sd-trade">If triggered: {c["trade"]}</div></div>')
     html.append('</div>')
     # open trades
@@ -844,7 +962,8 @@ Quant Strategy Dashboard — Automated Paper Trades</h2>"""]
         trs = ""
         for t in p["open_trades"]:
             cls = "sd-pos" if t["pnl"] >= 0 else "sd-neg"
-            trs += (f'<tr><td>{t["strategy"]}</td><td>{t["structure"]}</td>'
+            trs += (f'<tr><td>{strat_label(t["strategy"])}</td>'
+                    f'<td>{t["structure"]}</td>'
                     f'<td class="sd-legs">{legs_txt(t["legs"])}</td>'
                     f'<td>{t["qty"]}×</td><td>{_inr(t["cost"])}</td>'
                     f'<td>{_inr(t["value"])}</td>'
@@ -858,7 +977,7 @@ Quant Strategy Dashboard — Automated Paper Trades</h2>"""]
     # closed today
     if p["closed_trades"]:
         trs = "".join(
-            f'<tr><td>{t["strategy"]}</td><td>{t["structure"]}</td>'
+            f'<tr><td>{strat_label(t["strategy"])}</td><td>{t["structure"]}</td>'
             f'<td class="{"sd-pos" if t["pnl"] >= 0 else "sd-neg"}">'
             f'{_inr(t["pnl"], signed=True)}</td><td>{t["reason"]}</td><td>{t["when"]}</td></tr>'
             for t in p["closed_trades"])
@@ -868,7 +987,7 @@ Quant Strategy Dashboard — Automated Paper Trades</h2>"""]
                     f'<tbody>{trs}</tbody></table>')
     # signal log
     if p["signals"]:
-        rows = "".join(f'<tr><td>{g["when"]}</td><td>{g["strategy"]}</td>'
+        rows = "".join(f'<tr><td>{g["when"]}</td><td>{strat_label(g["strategy"])}</td>'
                        f'<td>{g["dir"] or "-"}</td><td>{g["detail"]}</td>'
                        f'<td>{"trade opened" if g["traded"] else "signal only"}</td></tr>'
                        for g in p["signals"])
@@ -885,6 +1004,11 @@ Quant Strategy Dashboard — Automated Paper Trades</h2>"""]
 .sd-badge{color:#fff;font-size:10px;padding:2px 8px;border-radius:10px;white-space:nowrap;}
 .sd-kv{display:flex;justify-content:space-between;color:#455a64;}
 .sd-note{margin-top:6px;color:#37474f;font-style:italic;}
+.sd-owns{margin-top:8px;border-top:1px dashed #b0bec5;padding-top:6px;}
+.sd-owns i{color:#37474f;font-size:11px;}
+.sd-tt{margin-top:4px;font-size:11px;color:#263238;background:rgba(255,255,255,.6);
+       border-left:3px solid #37474f;padding:3px 6px;border-radius:2px;}
+.sd-tt-sub{color:#78909c;font-weight:400;}
 .sd-trade{margin-top:4px;color:#78909c;}
 .sd-h3{font-size:15px;margin:18px 0 6px;color:#263238;}
 .sd-table{border-collapse:collapse;font-size:12px;background:white;width:100%;}
