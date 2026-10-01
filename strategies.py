@@ -893,6 +893,55 @@ STRAT_NAMES = {"S1": "S1 — Unusual OI + Volume",
                "S4_FOLLOW": "S4 — Put Skew (Follow)",
                "S4_FADE": "S4 — Put Skew (Fade)"}
 
+# Short user-reference for each strategy: the market logic, the exact trigger
+# rules the scanner applies, the structure traded, and the exit rules.
+# Rendered as a collapsed "How it works" block inside each card.
+STRAT_DOCS = {
+    "S1": """<b>Logic.</b> Informed traders act before the cash move: when one
+strike trades outsized volume <i>and</i> its OI is genuinely building, someone
+is paying real premium to express a view. We follow that flow.<br>
+<b>Triggers (all three).</b> Strike volume &ge; 3&times; the chain median ·
+OI change &ge; +25% of prior OI (new positions, not churn) · strike IV
+&lt; 1.25&times; ATM IV (skip when the crowd already overpaid).<br>
+<b>Trade.</b> Bullish call flow &rarr; bull call spread on the hot strike;
+bearish put flow &rarr; bear put spread. Wings 2 strikes out.<br>
+<b>Exits.</b> +100% target · &minus;50% stop · OI UNWOUND (&ge;20% of the
+buildup unwinds — the smart money left) · EOD 15:28.""",
+    "S2": """<b>Logic.</b> Implied volatility is mean-reverting — fear spikes
+decay and options end up overpriced vs how much the index actually moves.
+Sellers harvest that gap as theta, but only in a genuinely elevated-vol
+regime.<br>
+<b>Triggers.</b> Strike IV &ge; 2 standard deviations above its own intraday
+mean (z-score, &ge;12 samples) · regime gate: India VIX &ge; 20, or ATM IV
+&ge; 15 when VIX is unavailable.<br>
+<b>Trade.</b> Iron condor: sell ATM&plusmn;1SD call and put, buy wings 4
+strikes further. Wins if spot stays inside the expected range.<br>
+<b>Exits.</b> 40% of credit collected · stop if the credit doubles in cost ·
+immediate if spot breaks either short strike · EOD 15:28.""",
+    "S3": """<b>Logic.</b> Dealers short gamma at a heavy-OI strike must hedge
+mechanically — buying as spot approaches, selling as it breaks out — so big
+strikes act as magnets. The magnet is real flows, not chart magic.<br>
+<b>Triggers.</b> Wall = strike with max OI &times; gamma · spot within 1% of
+it · wall-strike volume &ge; 2&times; chain median (positions are being added
+now, not stale OI).<br>
+<b>Trade.</b> Long ATM call spread (sell 2 strikes up) — a cheap long-gamma
+bet that the wall gets absorbed and popped.<br>
+<b>Exits.</b> +100% target · &minus;50% stop · WALL REJECTED (spot falls 0.5%
+below entry — the squeeze premise is void) · EOD 15:28.""",
+    "S4": """<b>Logic.</b> OTM puts normally carry a modest IV premium. When
+that skew blows out, either institutions are buying real crash protection or
+the crowd is over-hedging — the skew can't tell you which, so OI breaks the
+tie.<br>
+<b>Triggers.</b> ~25-delta OTM put IV &minus; ATM IV &ge; 10 points. OI at
+that strike building &ge; 10% &rarr; FOLLOW (fresh conviction). Flat/falling
+&rarr; FADE (expensive hedge, no new money).<br>
+<b>Trade.</b> Follow: long put spread at the skewed strike. Fade: bull put
+spread — sell the rich put, buy a wing 2 strikes lower, collect the fear
+premium.<br>
+<b>Exits.</b> Follow: +100% / &minus;50% debit rules. Fade: 40% of credit /
+credit doubled. Both: EOD 15:28.""",
+}
+
 
 def strat_label(code):
     return STRAT_NAMES.get(code, code or "?")
@@ -920,6 +969,14 @@ Quant Strategy Dashboard — Automated Paper Trades</h2>"""]
                 f'{_inr(s["realized_today"], signed=True)}</b></span>'
                 f'<span>Open risk {_inr(s["open_risk"])}</span>'
                 f'<span>Open trades {len(p["open_trades"])}</span></div>')
+    # execution-guard summary (always-on rules that apply to every card)
+    html.append(
+        f'<p class="sd-guards">Rules in force: entries only Mon–Fri '
+        f'09:15–15:30 IST · first {WARMUP_CYCLES} scans after start are '
+        f'scan-only · a signal must stay hot {PERSIST_SCANS} consecutive '
+        f'scans · max {RISK_PER_TRADE * 100:.0f}% risk/trade and '
+        f'{MAX_TOTAL_HEAT * 100:.0f}% total open risk · no opposing '
+        f'direction bets · EOD exit {TIME_EXIT.strftime("%H:%M")}</p>')
     # strategy cards — each card shows the paper trades it owns
     def card_key(strat_code):
         return (strat_code or "").split("_")[0]
@@ -950,7 +1007,10 @@ Quant Strategy Dashboard — Automated Paper Trades</h2>"""]
             f'{rows}'
             f'<div class="sd-note">{c["note"] or "no anomaly yet"}</div>'
             f'{owns}'
-            f'<div class="sd-trade">If triggered: {c["trade"]}</div></div>')
+            f'<div class="sd-trade">If triggered: {c["trade"]}</div>'
+            f'<details class="sd-how"><summary>How it works</summary>'
+            f'<div class="sd-how-b">{STRAT_DOCS.get(c["id"], "")}</div></details>'
+            f'</div>')
     html.append('</div>')
     # open trades
     def legs_txt(legs):
@@ -1004,6 +1064,17 @@ Quant Strategy Dashboard — Automated Paper Trades</h2>"""]
 .sd-badge{color:#fff;font-size:10px;padding:2px 8px;border-radius:10px;white-space:nowrap;}
 .sd-kv{display:flex;justify-content:space-between;color:#455a64;}
 .sd-note{margin-top:6px;color:#37474f;font-style:italic;}
+.sd-guards{font-size:11px;color:#607d8b;background:#eceff1;border:1px solid #cfd8dc;
+           border-radius:4px;padding:5px 10px;margin:0 0 10px;}
+.sd-how{margin-top:8px;border-top:1px solid rgba(0,0,0,.08);padding-top:6px;}
+.sd-how summary{cursor:pointer;font-size:11px;font-weight:600;color:#1a237e;
+                list-style:none;}
+.sd-how summary:before{content:"▸ ";}
+.sd-how[open] summary:before{content:"▾ ";}
+.sd-how-b{margin-top:6px;font-size:11px;color:#37474f;line-height:1.5;
+          text-align:left;background:rgba(255,255,255,.7);padding:8px 10px;
+          border-radius:4px;}
+.sd-how-b i{color:#546e7a;}
 .sd-owns{margin-top:8px;border-top:1px dashed #b0bec5;padding-top:6px;}
 .sd-owns i{color:#37474f;font-size:11px;}
 .sd-tt{margin-top:4px;font-size:11px;color:#263238;background:rgba(255,255,255,.6);

@@ -150,6 +150,9 @@ def main():
         "S1 trades:" in html and "S3 trades:" in html and "S4 trades:" in html)
     run("strategy identifiers named, not just codes",
         "S1 — Unusual OI + Volume" in html and "S4 — Put Skew (Fade)" in html)
+    run("per-card 'How it works' reference + guard rules render",
+        html.count("How it works") == 4 and "Rules in force" in html
+        and "magnets" in html)
 
     # ---------------- cycle 2: MTM, TARGET exit, cooldown ----------------
     ltps[24650] = (130.0, 8.0)     # conviction leg repriced up
