@@ -32,6 +32,18 @@ A console opens showing fetch logs, and your browser opens
 - **Columns ▾ button** — choose which columns show (per side: LTP, Chg, OI,
   Chg OI, Volume, IV, Delta, Gamma, Theta/day, Vega/1%). Your selection is
   remembered in the browser. Defaults: LTP, Chg, OI, Chg OI, IV, Delta.
+
+## Multi-Strike Comparison Charts (below the table)
+
+- **5 strike cards** (default: ATM −2 … ATM +2), each a Call-vs-Put line chart
+  built from the full Postgres history of that strike.
+- **8 metric pills**: OI, OI Value (OI × LTP), Volume, LTP, Change OI,
+  Change OI Value, PCR (PE OI / CE OI), IV. Click to switch.
+- **Strikes box** — pick any 5 strikes (choices lock once 5 are selected).
+- **Auto refresh checkbox** — charts reload with the table's interval;
+  untick to freeze them.
+- **download** button on each card saves the chart as a PNG.
+- Backed by `/api/strikes` and `/api/series?metric=…&strikes=…` JSON endpoints.
 - A countdown shows when the next auto refresh happens
 - The chosen interval persists until you close the app
 
