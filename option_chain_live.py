@@ -4,6 +4,8 @@
   (3s / 10s / 30s / 60s, default 60s) and a column picker (LTP, Chg, OI,
   Chg OI, Volume, IV, Delta, Gamma, Theta, Vega per side)
 - Computes Black-Scholes greeks and persists everything to PostgreSQL
+- Scans every snapshot with the quant strategy engine (strategies.py) and
+  renders the Strategy Dashboard with automated paper trades
 
 Usage: python option_chain_live.py [SYMBOL] [STRIKE]   (defaults: NIFTY, 22700)
 """
@@ -20,10 +22,13 @@ from urllib.parse import urlparse, parse_qs
 import psycopg2
 import requests
 
+import strategies
+
 HTML_PATH = Path(__file__).parent / "option_chain_live.html"
 HOST, PORT = "127.0.0.1", 8899
 DB_DSN = "postgresql://postgres:postgres@localhost:5432/postgres"
 DB_TABLE = "option_chain_snapshots"
+strategies.configure(dsn=DB_DSN, snap_table=DB_TABLE)
 
 HEADERS = {
     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -49,6 +54,31 @@ MARKET_OPEN_TIME = datetime.time(9, 15)
 MARKET_CLOSE_TIME = datetime.time(15, 40)   # F&O trading close
 COLLECT_END_TIME = datetime.time(16, 5)     # keep polling for reconciliation
 URL_MARKET_STATUS = "https://www.nseindia.com/api/marketStatus"
+
+# Session used by the strategy engine for the India VIX poll (best effort)
+VIX_BUNDLE = {"session": None, "cookies": None}
+
+
+def fetch_json_nse(url):
+    """GET a NSE JSON endpoint with the shared cookie jar; None on failure."""
+    if VIX_BUNDLE["session"] is None:
+        VIX_BUNDLE["session"], VIX_BUNDLE["cookies"] = new_session()
+    try:
+        r = VIX_BUNDLE["session"].get(url, headers=HEADERS, timeout=10,
+                                      cookies=VIX_BUNDLE["cookies"])
+        if r.status_code == 401:
+            VIX_BUNDLE["session"].close()
+            VIX_BUNDLE["session"], VIX_BUNDLE["cookies"] = new_session()
+            r = VIX_BUNDLE["session"].get(url, headers=HEADERS, timeout=10,
+                                          cookies=VIX_BUNDLE["cookies"])
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        try:
+            VIX_BUNDLE["session"].close()
+        except Exception:
+            pass
+        VIX_BUNDLE["session"] = None
+        return None
 
 COLUMNS = ["ltp", "chg", "oi", "chg_oi", "volume", "iv", "delta", "gamma", "theta", "vega"]
 COL_LABELS = {"ltp": "LTP", "chg": "Chg", "oi": "OI", "chg_oi": "Chg&nbsp;OI",
@@ -360,7 +390,7 @@ def build_row_html(r, atm_strike):
 
 
 def build_html(symbol, expiry, spot, server_ts, fetched, interval, table_rows,
-               banner=None, err=None, atm_strike=None):
+               banner=None, err=None, atm_strike=None, strategy_section=""):
     body = f'<p class="err">{err}</p>' if err else table_rows
     closed = banner is not None
     controls_disabled = 'disabled' if closed else ''
@@ -490,6 +520,7 @@ loadCols();
 </tbody></table>
 <p style="font-size:12px;color:#777;margin-top:10px;">
 Greeks: Black-Scholes, r={RISK_FREE_RATE}, IV from NSE. Every fetch saved to PostgreSQL (table: {DB_TABLE}).</p>
+{strategy_section}
 
 <h2 style="font-size:18px;margin:28px 0 4px;">Multi-Strike CE vs PE Comparison</h2>
 <p style="color:#555;font-size:13px;margin:0 0 10px;">Call vs Put movement across {CHART_STRIKES} strikes in one view, built from the Postgres history.</p>
@@ -665,11 +696,19 @@ def do_fetch():
                 trs = "\n".join(build_row_html(tuple(r[:23]), STATE["strike"])
                                 for r in rows)
                 last_ts = rows[0][23]
+                try:
+                    payload = strategies.static_payload(STATE["symbol"],
+                                                        spot=rows[0][1])
+                    sdash = strategies.render_dashboard(payload)
+                except Exception as e:
+                    print("strategy dashboard (closed) failed:", e)
+                    sdash = ""
                 html = build_html(
                     STATE["symbol"], STATE.get("expiry", "-"), rows[0][1], rows[0][2],
                     last_ts + " (last collect)", STATE["interval"], trs,
                     banner="MARKET IS CLOSED — showing last collected data "
-                           f"({last_ts}). Refresh is disabled until 9:15 AM.")
+                           f"({last_ts}). Refresh is disabled until 9:15 AM.",
+                    strategy_section=sdash)
             else:
                 html = build_html(STATE["symbol"], "-", None, None, ts,
                                   STATE["interval"], "",
@@ -724,8 +763,25 @@ def do_fetch():
                     STATE["strike"]))
 
             n = db_insert(STATE["symbol"], expiry, spot, server_ts, db_args)
+
+            # strategy scanners + automated paper trades on this snapshot
+            sdash = ""
+            try:
+                vix = strategies.get_vix(fetch_json_nse)
+                payload = strategies.run_cycle(STATE["symbol"], expiry, spot,
+                                               db_args, datetime.datetime.now(),
+                                               vix=vix, t_years=t)
+                sdash = strategies.render_dashboard(payload)
+                if payload["new_signals"]:
+                    for g in payload["new_signals"]:
+                        print(f"SIGNAL {g['strategy']} {g['dir'] if 'dir' in g else ''} "
+                              f"{g['detail']}")
+            except Exception as e:
+                print("strategy cycle failed:", e)
+
             html = build_html(STATE["symbol"], expiry, spot, server_ts, fetched,
-                              STATE["interval"], "\n".join(trs))
+                              STATE["interval"], "\n".join(trs),
+                              strategy_section=sdash)
             HTML_PATH.write_text(html, encoding='utf-8')
             STATE["last_fetch"] = fetched
             STATE["last_error"] = None
