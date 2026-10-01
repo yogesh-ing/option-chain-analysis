@@ -350,14 +350,14 @@ def open_trade(symbol, strategy, signal_id, direction, structure, legs, meta, no
                 return None, f"leg {side} {k:.0f} unpriced — trade skipped"
             cost += ltp if action == "buy" else -ltp
             priced.append({"strike": k, "side": side, "action": action, "entry": ltp})
-        # max loss per lot: debit spread pays full premium; credit spread
-        # risks wing width minus credit
+        # max loss per lot (premium/width already × lot multiplier below)
         if cost > 0:
             max_loss = cost
         else:
             width = max(l["strike"] for l in priced) - min(l["strike"] for l in priced)
             max_loss = max(width - abs(cost), 0.5)
-        lots = max(1, min(MAX_LOTS, int((PAPER_ACCOUNT * RISK_PER_TRADE) // max_loss)))
+        lots = max(1, min(MAX_LOTS, int((PAPER_ACCOUNT * RISK_PER_TRADE)
+                                        // (max_loss * lot))))
         cur.execute("""INSERT INTO paper_trades
             (symbol, strategy, signal_id, direction, structure, legs, qty, lot,
              net_cost, entry_at, mtm_cost, u_pnl, status, meta)
