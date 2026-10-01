@@ -32,6 +32,18 @@ A console opens showing fetch logs, and your browser opens
 - **Columns ▾ button** — choose which columns show (per side: LTP, Chg, OI,
   Chg OI, Volume, IV, Delta, Gamma, Theta/day, Vega/1%). Your selection is
   remembered in the browser. Defaults: LTP, Chg, OI, Chg OI, IV, Delta.
+
+## Multi-Strike Comparison Charts (below the table)
+
+- **5 strike cards** (default: ATM −2 … ATM +2), each a Call-vs-Put line chart
+  built from the full Postgres history of that strike.
+- **8 metric pills**: OI, OI Value (OI × LTP), Volume, LTP, Change OI,
+  Change OI Value, PCR (PE OI / CE OI), IV. Click to switch.
+- **Strikes box** — pick any 5 strikes (choices lock once 5 are selected).
+- **Auto refresh checkbox** — charts reload with the table's interval;
+  untick to freeze them.
+- **download** button on each card saves the chart as a PNG.
+- Backed by `/api/strikes` and `/api/series?metric=…&strikes=…` JSON endpoints.
 - A countdown shows when the next auto refresh happens
 - The chosen interval persists until you close the app
 
@@ -41,6 +53,28 @@ Black-Scholes greeks (Delta, Gamma, Theta/day, Vega per 1% IV move) are
 computed each fetch from NSE's IV, spot and time to expiry (risk-free rate
 6.5% — edit `RISK_FREE_RATE` in `option_chain_live.py`). They are stored in
 the DB and shown on the page.
+
+## Quant Strategy Dashboard (below the table)
+
+Runs automatically on every snapshot — no extra command.
+
+- Four strategy cards (per the strategy framework): **S1 Unusual OI +
+  Volume Surge**, **S2 VIX/IV Spike — Sell Premium**, **S3 Gamma Wall /
+  Squeeze Setup**, **S4 Put Skew Anomaly**. Each card shows its live scan
+  metrics and status: `IDLE` → `ARMED` → `TRIGGERED`.
+- When a card triggers, the engine **opens a paper trade** sized by the
+  2%-account-risk rule (₹10 lakh paper account, edit `PAPER_ACCOUNT` /
+  `RISK_PER_TRADE` in `strategies.py`): conviction spreads (S1), iron
+  condor (S2), ATM gamma call spread (S3), follow/fade put spreads (S4).
+- Open trades are marked to market every refresh and close on target,
+  stop, thesis reversal (OI unwind / wall rejection / spot breakout) or
+  the 15:28 IST time exit. Realised and unrealised P&L are shown on the
+  page and persist in Postgres (`strategy_signals`, `paper_trades`).
+- Thresholds live at the top of `strategies.py` (`VOL_MEDIAN_MULT`,
+  `OI_BUILD_FRAC`, `IV_ZSCORE`, `GEX_WALL_PCT`, `SKEW_PREMIUM`,
+  `COOLDOWN_MIN`). Multi-day z-scores tighten automatically as the
+  snapshot history grows (first days use cross-sectional fallbacks).
+- Paper trading only — no broker is contacted.
 
 ## Database (PostgreSQL)
 

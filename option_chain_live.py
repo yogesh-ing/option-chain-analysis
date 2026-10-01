@@ -4,10 +4,13 @@
   (3s / 10s / 30s / 60s, default 60s) and a column picker (LTP, Chg, OI,
   Chg OI, Volume, IV, Delta, Gamma, Theta, Vega per side)
 - Computes Black-Scholes greeks and persists everything to PostgreSQL
+- Scans every snapshot with the quant strategy engine (strategies.py) and
+  renders the Strategy Dashboard with automated paper trades
 
 Usage: python option_chain_live.py [SYMBOL] [STRIKE]   (defaults: NIFTY, 22700)
 """
 import datetime
+import json
 import math
 import sys
 import threading
@@ -19,10 +22,13 @@ from urllib.parse import urlparse, parse_qs
 import psycopg2
 import requests
 
+import strategies
+
 HTML_PATH = Path(__file__).parent / "option_chain_live.html"
 HOST, PORT = "127.0.0.1", 8899
 DB_DSN = "postgresql://postgres:postgres@localhost:5432/postgres"
 DB_TABLE = "option_chain_snapshots"
+strategies.configure(dsn=DB_DSN, snap_table=DB_TABLE)
 
 HEADERS = {
     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -37,6 +43,8 @@ URL_CHAIN = ("https://www.nseindia.com/api/option-chain-v3?"
 
 ITM_COUNT = 10   # strikes below ATM shown on both sides
 OTM_COUNT = 10   # strikes above ATM shown on both sides  (10 + ATM + 10 = 21 rows)
+CHART_STRIKES = 5   # strikes compared in the chart section below the table
+CHART_DEFAULTS = ["ltp", "oi", "pcr"]   # initially selected metric pills
 INTERVALS = [3, 10, 30, 60]  # seconds; 60 is default
 RISK_FREE_RATE = 0.065  # annualised, adjust if needed
 
@@ -46,6 +54,31 @@ MARKET_OPEN_TIME = datetime.time(9, 15)
 MARKET_CLOSE_TIME = datetime.time(15, 40)   # F&O trading close
 COLLECT_END_TIME = datetime.time(16, 5)     # keep polling for reconciliation
 URL_MARKET_STATUS = "https://www.nseindia.com/api/marketStatus"
+
+# Session used by the strategy engine for the India VIX poll (best effort)
+VIX_BUNDLE = {"session": None, "cookies": None}
+
+
+def fetch_json_nse(url):
+    """GET a NSE JSON endpoint with the shared cookie jar; None on failure."""
+    if VIX_BUNDLE["session"] is None:
+        VIX_BUNDLE["session"], VIX_BUNDLE["cookies"] = new_session()
+    try:
+        r = VIX_BUNDLE["session"].get(url, headers=HEADERS, timeout=10,
+                                      cookies=VIX_BUNDLE["cookies"])
+        if r.status_code == 401:
+            VIX_BUNDLE["session"].close()
+            VIX_BUNDLE["session"], VIX_BUNDLE["cookies"] = new_session()
+            r = VIX_BUNDLE["session"].get(url, headers=HEADERS, timeout=10,
+                                          cookies=VIX_BUNDLE["cookies"])
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        try:
+            VIX_BUNDLE["session"].close()
+        except Exception:
+            pass
+        VIX_BUNDLE["session"] = None
+        return None
 
 COLUMNS = ["ltp", "chg", "oi", "chg_oi", "volume", "iv", "delta", "gamma", "theta", "vega"]
 COL_LABELS = {"ltp": "LTP", "chg": "Chg", "oi": "OI", "chg_oi": "Chg&nbsp;OI",
@@ -224,6 +257,64 @@ def db_insert(symbol, expiry, spot, server_ts, enriched_rows):
         conn.close()
 
 
+def db_available_strikes(symbol):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT DISTINCT strike FROM {DB_TABLE} WHERE symbol = %s ORDER BY strike",
+                    (symbol,))
+        return [float(r[0]) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def db_series(symbol, strikes, metric):
+    """Per-strike CE & PE time series for one metric.
+    Returns {strike: {"times": [...], "ce": [...], "pe": [...]}}.
+    Supported metrics: ltp, oi, oi_value, volume, chg_oi, chg_oi_value, pcr, iv.
+    """
+    col_map = {"ltp": ("ce_ltp", "pe_ltp"),
+               "oi": ("ce_oi", "pe_oi"),
+               "oi_value": ("ce_oi", "pe_oi"),
+               "volume": ("ce_volume", "pe_volume"),
+               "chg_oi": ("ce_chg_oi", "pe_chg_oi"),
+               "chg_oi_value": ("ce_chg_oi", "pe_chg_oi"),
+               "iv": ("ce_iv", "pe_iv")}
+    pcr_mode = metric == "pcr"
+    if not pcr_mode and metric not in col_map:
+        raise ValueError(f"unknown metric {metric}")
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        cur = conn.cursor()
+        result = {}
+        for k in strikes:
+            if pcr_mode:
+                cur.execute(f"""SELECT to_char(snapshot_at, 'HH24:MI'),
+                                       COALESCE(pe_oi, 0) / NULLIF(ce_oi, 0)
+                                FROM {DB_TABLE}
+                                WHERE symbol = %s AND strike = %s
+                                ORDER BY snapshot_at""", (symbol, k))
+                rows = cur.fetchall()
+                result[k] = {"times": [r[0] for r in rows],
+                             "ce": [round(float(r[1]), 3) if r[1] is not None else None
+                                    for r in rows],
+                             "pe": None}
+            else:
+                ce_c, pe_c = col_map[metric]
+                cur.execute(f"""SELECT to_char(snapshot_at, 'HH24:MI'), {ce_c}, {pe_c}
+                                FROM {DB_TABLE}
+                                WHERE symbol = %s AND strike = %s
+                                ORDER BY snapshot_at""", (symbol, k))
+                rows = cur.fetchall()
+                f = lambda v: round(float(v), 2) if v is not None else None
+                result[k] = {"times": [r[0] for r in rows],
+                             "ce": [f(r[1]) for r in rows],
+                             "pe": [f(r[2]) for r in rows]}
+        return result
+    finally:
+        conn.close()
+
+
 def db_latest_rows(symbol):
     """Full latest snapshot (23 fields per row) for the frozen closed-market page."""
     conn = psycopg2.connect(DB_DSN)
@@ -299,7 +390,7 @@ def build_row_html(r, atm_strike):
 
 
 def build_html(symbol, expiry, spot, server_ts, fetched, interval, table_rows,
-               banner=None, err=None):
+               banner=None, err=None, atm_strike=None, strategy_section=""):
     body = f'<p class="err">{err}</p>' if err else table_rows
     closed = banner is not None
     controls_disabled = 'disabled' if closed else ''
@@ -310,6 +401,9 @@ def build_html(symbol, expiry, spot, server_ts, fetched, interval, table_rows,
                     "  document.getElementById('countdown').textContent = "
                     "'next auto refresh in ' + left + 's';\n"
                     "  if (left <= 0) location.reload();\n}, 1000);")
+    defaults_json = json.dumps(CHART_DEFAULTS)
+    atm_js = repr(float(atm_strike)) if atm_strike is not None else "22700"
+    chart_strikes_js = str(CHART_STRIKES)
     opts = "".join(f'<option value="{s}"{" selected" if s == interval else ""}>{s}s</option>'
                    for s in INTERVALS)
     heads = "".join(f'<th class="c-{c}">{COL_LABELS[c]}</th>' for c in COLUMNS)
@@ -352,6 +446,13 @@ tbody tr:nth-child(even) {{ background: #f5f5f5; }}
              box-shadow: 0 2px 10px rgba(0,0,0,.3); font-size: 13px;
              columns: 2; column-gap: 24px; max-height: 70vh; overflow: auto; }}
 .hidden-col {{ display: none; }}
+.pill {{ border: 1px solid #b0bec5; background: white; color: #455a64;
+        padding: 4px 12px; border-radius: 14px; cursor: pointer; font-size: 12px;
+        letter-spacing: .3px; }}
+.pill-on {{ background: #1a237e; border-color: #1a237e; color: white; }}
+.dl {{ font-size: 11px; padding: 2px 8px; cursor: pointer; background: #eceff1;
+      border: 1px solid #b0bec5; }}
+.dl:hover {{ background: #cfd8dc; }}
 </style></head>
 <body>
 {banner_html}
@@ -419,6 +520,139 @@ loadCols();
 </tbody></table>
 <p style="font-size:12px;color:#777;margin-top:10px;">
 Greeks: Black-Scholes, r={RISK_FREE_RATE}, IV from NSE. Every fetch saved to PostgreSQL (table: {DB_TABLE}).</p>
+{strategy_section}
+
+<h2 style="font-size:18px;margin:28px 0 4px;">Multi-Strike CE vs PE Comparison</h2>
+<p style="color:#555;font-size:13px;margin:0 0 10px;">Call vs Put movement across {CHART_STRIKES} strikes in one view, built from the Postgres history.</p>
+<div class="controls" style="flex-wrap:wrap;">
+  <div id="pills" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+  <label>Strikes:
+    <select id="chart-strikes" multiple size="1" style="min-width:210px;"></select>
+  </label>
+  <label style="font-size:13px;">Auto refresh:
+    <input type="checkbox" id="chart-auto" checked>
+  </label>
+  <span style="color:#777;font-size:12px;">follows the table's interval</span>
+</div>
+<div id="chart-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;"></div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script>
+const METRICS = [
+  ['oi','OI'], ['oi_value','OI VALUE'], ['volume','VOLUME'], ['ltp','LTP'],
+  ['chg_oi','CHANGE OI'], ['chg_oi_value','CHANGE OI VALUE'], ['pcr','PCR'], ['iv','IV']
+];
+const CHART_DEFAULT_METRICS = {defaults_json};
+let curMetric = CHART_DEFAULT_METRICS[0] || 'ltp';
+let curStrikes = [];
+const charts = {{}};
+
+function pillRow() {{
+  const p = document.getElementById('pills');
+  p.innerHTML = '';
+  for (const [key, label] of METRICS) {{
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.className = 'pill' + (key === curMetric ? ' pill-on' : '');
+    b.onclick = () => {{ curMetric = key; pillRow(); loadCharts(); }};
+    p.appendChild(b);
+  }}
+}}
+
+async function loadStrikeOptions() {{
+  const sel = document.getElementById('chart-strikes');
+  try {{
+    const list = await (await fetch('/api/strikes')).json();
+    sel.innerHTML = '';
+    const atmIdx = list.reduce((best, s, i) =>
+      Math.abs(s - {atm_js}) < Math.abs(list[best] - {atm_js}) ? i : best, 0);
+    const chosen = new Set();
+    for (let off = -2; off <= 2; off++) {{
+      const i = Math.min(list.length - 1, Math.max(0, atmIdx + off));
+      chosen.add(list[i]);
+    }}
+    for (const s of list) {{
+      const o = document.createElement('option');
+      o.value = s; o.textContent = s.toLocaleString();
+      o.selected = chosen.has(s);
+      sel.appendChild(o);
+    }}
+    curStrikes = [...chosen];
+    sel.onchange = () => {{
+      curStrikes = [...sel.selectedOptions].map(o => parseFloat(o.value)).slice(0, {chart_strikes_js});
+      if (curStrikes.length === {chart_strikes_js})
+        [...sel.options].forEach(o => o.disabled = !curStrikes.includes(parseFloat(o.value)) && !o.selected);
+      else
+        [...sel.options].forEach(o => o.disabled = false);
+      loadCharts();
+    }};
+    loadCharts();
+  }} catch (e) {{
+    document.getElementById('chart-grid').textContent = 'strike list unavailable: ' + e;
+  }}
+}}
+
+async function loadCharts() {{
+  if (!curStrikes.length) return;
+  let data;
+  try {{
+    data = await (await fetch('/api/series?metric=' + curMetric +
+                    '&strikes=' + curStrikes.join(','))).json();
+  }} catch (e) {{
+    return;
+  }}
+  const grid = document.getElementById('chart-grid');
+  grid.innerHTML = '';
+  for (const k of curStrikes) {{
+    const s = data[k] || data[k.toFixed(1)] || data[String(k)];
+    if (!s) continue;
+    const card = document.createElement('div');
+    card.style.cssText = 'background:white;border:1px solid #ddd;padding:10px;';
+    const label = curMetric === 'pcr' ? 'PCR (PE OI / CE OI)'
+                : curMetric.endsWith('_value') ? curMetric.replace('_',' ').toUpperCase() + ' (= OI × LTP)'
+                : curMetric.toUpperCase();
+    card.innerHTML = '<b>' + k.toLocaleString() + '</b>' +
+      '<div style="color:#777;font-size:11px;margin-bottom:6px;">CALL vs PUT — ' + label + '</div>' +
+      '<div style="display:flex;justify-content:flex-end;gap:6px;">' +
+      '<button class="dl">download</button></div>' +
+      '<canvas height="200"></canvas>';
+    grid.appendChild(card);
+    const ctx = card.querySelector('canvas');
+    const ds = [{{ label: 'Call', data: s.ce, borderColor: '#2196f3',
+                  backgroundColor: 'rgba(33,150,243,.12)', fill: true, tension: .25, pointRadius: 0 }}];
+    if (s.pe) ds.push({{ label: 'Put', data: s.pe, borderColor: '#ff9800',
+                        backgroundColor: 'rgba(255,152,0,.12)', fill: true, tension: .25, pointRadius: 0 }});
+    if (charts[k]) charts[k].destroy();
+    charts[k] = new Chart(ctx, {{
+      type: 'line',
+      data: {{ labels: s.times, datasets: ds }},
+      options: {{
+        animation: false,
+        plugins: {{ legend: {{ display: true, labels: {{ boxWidth: 10, font: {{ size: 10 }} }} }} }},
+        scales: {{ x: {{ ticks: {{ maxTicksLimit: 8, font: {{ size: 9 }} }} }} }}
+      }}
+    }});
+    card.querySelector('.dl').onclick = () => {{
+      const a = document.createElement('a');
+      a.href = charts[k].toBase64Image();
+      a.download = k + '_' + curMetric + '.png';
+      a.click();
+    }};
+  }}
+}}
+
+document.getElementById('chart-auto').onchange = function() {{
+  this.parentElement.style.opacity = this.checked ? 1 : .5;
+}};
+
+setInterval(() => {{
+  if (document.getElementById('chart-auto').checked &&
+      document.getElementById('iv') && !document.getElementById('iv').disabled &&
+      left !== undefined && left <= 1) loadCharts();
+}}, 1000);
+
+pillRow();
+loadStrikeOptions();
+</script>
 </body></html>"""
 
 
@@ -462,11 +696,19 @@ def do_fetch():
                 trs = "\n".join(build_row_html(tuple(r[:23]), STATE["strike"])
                                 for r in rows)
                 last_ts = rows[0][23]
+                try:
+                    payload = strategies.static_payload(STATE["symbol"],
+                                                        spot=rows[0][1])
+                    sdash = strategies.render_dashboard(payload)
+                except Exception as e:
+                    print("strategy dashboard (closed) failed:", e)
+                    sdash = ""
                 html = build_html(
                     STATE["symbol"], STATE.get("expiry", "-"), rows[0][1], rows[0][2],
                     last_ts + " (last collect)", STATE["interval"], trs,
                     banner="MARKET IS CLOSED — showing last collected data "
-                           f"({last_ts}). Refresh is disabled until 9:15 AM.")
+                           f"({last_ts}). Refresh is disabled until 9:15 AM.",
+                    strategy_section=sdash)
             else:
                 html = build_html(STATE["symbol"], "-", None, None, ts,
                                   STATE["interval"], "",
@@ -521,8 +763,25 @@ def do_fetch():
                     STATE["strike"]))
 
             n = db_insert(STATE["symbol"], expiry, spot, server_ts, db_args)
+
+            # strategy scanners + automated paper trades on this snapshot
+            sdash = ""
+            try:
+                vix = strategies.get_vix(fetch_json_nse)
+                payload = strategies.run_cycle(STATE["symbol"], expiry, spot,
+                                               db_args, datetime.datetime.now(),
+                                               vix=vix, t_years=t)
+                sdash = strategies.render_dashboard(payload)
+                if payload["new_signals"]:
+                    for g in payload["new_signals"]:
+                        print(f"SIGNAL {g['strategy']} {g['dir'] if 'dir' in g else ''} "
+                              f"{g['detail']}")
+            except Exception as e:
+                print("strategy cycle failed:", e)
+
             html = build_html(STATE["symbol"], expiry, spot, server_ts, fetched,
-                              STATE["interval"], "\n".join(trs))
+                              STATE["interval"], "\n".join(trs),
+                              strategy_section=sdash)
             HTML_PATH.write_text(html, encoding='utf-8')
             STATE["last_fetch"] = fetched
             STATE["last_error"] = None
@@ -575,6 +834,21 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 pass
             self._send(200, "ok")
+        elif parsed.path == "/api/strikes":
+            try:
+                self._send(200, json.dumps(db_available_strikes(STATE["symbol"])),
+                           "application/json")
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}), "application/json")
+        elif parsed.path == "/api/series":
+            q = parse_qs(parsed.query)
+            try:
+                strikes = [float(s) for s in q.get('strikes', [''])[0].split(',') if s]
+                metric = q.get('metric', ['ltp'])[0]
+                data = db_series(STATE["symbol"], strikes[:CHART_STRIKES], metric)
+                self._send(200, json.dumps(data), "application/json")
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}), "application/json")
         else:
             self._send(404, "not found")
 
