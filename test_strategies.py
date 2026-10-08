@@ -16,7 +16,7 @@ import strategies
 
 SYMBOL = "TESTNIFTY"
 DB = "postgresql://postgres:postgres@localhost:5432/postgres"
-strategies.configure(dsn=DB)
+strategies.configure(dsn=DB, strat_dsn=DB)
 
 SPOT = 24480.0
 STRIKES = [24000 + 50 * i for i in range(21)]          # 24000..25000
@@ -201,6 +201,85 @@ def main():
     n_sig, n_tr = count("strategy_signals"), count("paper_trades")
     run(f"DB rows written ({n_sig} signals, {n_tr} trades)",
         n_sig >= 3 and n_tr >= 3)
+
+    # ---- reset engine per-process state so these tests run on a clean slate ----
+    strategies._scan_count.clear()
+    strategies._hot_streak.clear()
+    strategies._schema_done = False
+    strategies.ensure_schema()
+    cleanup()
+    # loosen warm-up/persistence for these focused exit tests so a single hot
+    # cycle opens a trade (we're validating exits, not entry gating here).
+    _warmup_orig = strategies.WARMUP_CYCLES
+    _persist_orig = strategies.PERSIST_SCANS
+    strategies.WARMUP_CYCLES = 0
+    strategies.PERSIST_SCANS = 1
+
+    # ---- new: max-hold timer closes a trade that never hit target/stop ----
+    # Cycle 1 (open): a HOT S1 snapshot so the trade opens.
+    # Cycle 2 (61 min later): flat prices (value==cost, no target/stop) and a
+    # COOLED flow (no fresh signal, no soft-book trigger) -> the only remaining
+    # exit is MAX HOLD 60m.  Use a pre-15:28 clock so EOD doesn't fire first.
+    NOW_A = datetime.datetime(2026, 10, 1, 14, 50)
+    NOW_B = NOW_A + datetime.timedelta(minutes=61)   # 15:51 -> EOD would fire,
+                                                       # but MAX HOLD is checked first
+    ltps_open, vols_open, ois_open, chg_open, ivs_open, dels_open = base_snapshot()
+    # keep the S1 hot setup intact for the open cycle (350000 CE vol @ 24650).
+    ltps_open[24650] = (100.0, 8.0)     # long CE entry 100
+    ltps_open[24750] = (40.0, 6.0)      # short CE entry 40  -> cost 60
+    args_open = snap_args(SPOT, ltps_open, vols_open, ois_open, chg_open, ivs_open, dels_open)
+    pA = strategies.run_cycle(SYMBOL, EXPIRY, SPOT, args_open, NOW_A, vix=None,
+                              t_years=29 / 365)
+    run("max-hold setup: S1 trade opened with flat prices (no target/stop possible)",
+        any(t["strategy"] == "S1" for t in pA["open_trades"]))
+    # hold cycle: flat prices, cooled flow.
+    ltps_hold, vols_h, ois_h, chg_h, ivs_h, dels_h = base_snapshot()
+    vols_h[24650] = (26000, 22000)      # cooled: below 3x median
+    ltps_hold[24650] = (100.0, 8.0)     # same prices -> value == cost == 60
+    ltps_hold[24750] = (40.0, 6.0)
+    args_hold = snap_args(SPOT, ltps_hold, vols_h, ois_h, chg_h, ivs_h, dels_h)
+    pB = strategies.run_cycle(SYMBOL, EXPIRY, SPOT, args_hold, NOW_B, vix=None,
+                              t_years=29 / 365)
+    s1_held = [t for t in pB["closed_trades"] if t["strategy"] == "S1"]
+    run("max-hold 60m closes an open S1 trade that never hit target/stop",
+        s1_held and s1_held[0]["reason"] == "MAX HOLD 60m")
+
+    # ---- reset again for the soft-book test ----
+    strategies._scan_count.clear()
+    strategies._hot_streak.clear()
+    strategies._schema_done = False
+    strategies.ensure_schema()
+    cleanup()
+
+    # ---- new: soft profit-book at +70% debit when the signal has cooled ----
+    # Cycle 1 (open): HOT S1 snapshot -> trade opens, cost 60 (long 100 / short 40).
+    # Cycle 2 (2 min later): reprice long to 125, short to 18 -> value 107 = +78%
+    # of cost, AND cool the flow -> SOFT BOOK +70% fires before +100% hard target.
+    NOW_C = datetime.datetime(2026, 10, 1, 14, 55)
+    NOW_D = NOW_C + datetime.timedelta(minutes=2)
+    ltps_so, vols_so, ois_so, chg_so, ivs_so, dels_so = base_snapshot()
+    ltps_so[24650] = (100.0, 8.0)    # entry
+    ltps_so[24750] = (40.0, 6.0)
+    args_so_open = snap_args(SPOT, ltps_so, vols_so, ois_so, chg_so, ivs_so, dels_so)
+    pC = strategies.run_cycle(SYMBOL, EXPIRY, SPOT, args_so_open, NOW_C, vix=None,
+                              t_years=29 / 365)
+    run("soft-book setup: fresh S1 trade opened for the +70% test",
+        any(t["strategy"] == "S1" for t in pC["open_trades"]))
+    # soft cycle: repriced up + cooled flow.
+    ltps_soft, vols_s2, ois_s2, chg_s2, ivs_s2, dels_s2 = base_snapshot()
+    vols_s2[24650] = (26000, 22000)  # cooled: below 3x median
+    ltps_soft[24650] = (125.0, 8.0)  # value 125 - 18 = 107 vs cost 60 = +78%
+    ltps_soft[24750] = (18.0, 6.0)
+    args_so_soft = snap_args(SPOT, ltps_soft, vols_s2, ois_s2, chg_s2, ivs_s2, dels_s2)
+    pD = strategies.run_cycle(SYMBOL, EXPIRY, SPOT, args_so_soft, NOW_D, vix=None,
+                              t_years=29 / 365)
+    s1_soft = [t for t in pD["closed_trades"] if t["strategy"] == "S1"]
+    run("S1 soft-books at +70% when flow cools, before the +100% hard target",
+        s1_soft and s1_soft[0]["reason"] == "SOFT BOOK +70%")
+
+    cleanup()
+    strategies.WARMUP_CYCLES = _warmup_orig
+    strategies.PERSIST_SCANS = _persist_orig
 
     cleanup()
     print("TESTNIFTY rows cleaned up.")

@@ -12,6 +12,7 @@ Usage: python option_chain_live.py [SYMBOL] [STRIKE]   (defaults: NIFTY, 22700)
 import datetime
 import json
 import math
+import os
 import sys
 import threading
 import time
@@ -23,12 +24,19 @@ import psycopg2
 import requests
 
 import strategies
+import observation_board
 
 HTML_PATH = Path(__file__).parent / "option_chain_live.html"
-HOST, PORT = "127.0.0.1", 8899
-DB_DSN = "postgresql://postgres:postgres@localhost:5432/postgres"
-DB_TABLE = "option_chain_snapshots"
-strategies.configure(dsn=DB_DSN, snap_table=DB_TABLE)
+from config import cfg
+
+HOST = cfg.server_host
+PORT = cfg.server_port
+DB_DSN = cfg.db_dsn
+DB_TABLE = cfg.snap_table
+# Strategies state (signals + paper_trades) lives in its own DB so the live
+# option-chain snapshot DB can be shared without coupling the two concerns.
+STRAT_DSN = cfg.strat_dsn
+strategies.configure(dsn=DB_DSN, strat_dsn=STRAT_DSN, snap_table=DB_TABLE)
 
 HEADERS = {
     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -89,8 +97,11 @@ COL_LABELS = {"ltp": "LTP", "chg": "Chg", "oi": "OI", "chg_oi": "Chg&nbsp;OI",
 # ---------------------------------------------------------------- NSE fetch --
 def new_session():
     session = requests.Session()
-    r = session.get(URL_OC, headers=HEADERS, timeout=10)
-    return session, dict(r.cookies)
+    try:
+        r = session.get(URL_OC, headers=HEADERS, timeout=10)
+        return session, dict(r.cookies)
+    except Exception:
+        return session, {}  # continue without NSE cookies; fetcher will retry
 
 
 def fetch_chain(session, cookies, symbol, mode, expiry):
@@ -194,6 +205,29 @@ GREEK_COLS = ["ce_delta", "ce_gamma", "ce_theta", "ce_vega",
               "pe_delta", "pe_gamma", "pe_theta", "pe_vega"]
 
 
+def _try_db(func):
+    """Decorator: skip DB-dependent functions when Postgres is unreachable."""
+    def wrapper(*a, **kw):
+        if not DB_AVAILABLE:
+            return None if func.__name__ in ('db_latest_rows', 'db_series', 'db_available_strikes') else []
+        try:
+            return func(*a, **kw)
+        except Exception as e:
+            print(f"DB call {func.__name__} failed: {e}")
+            return None if func.__name__ in ('db_latest_rows', 'db_series', 'db_available_strikes') else []
+    return wrapper
+
+
+DB_AVAILABLE = True
+try:
+    _test = psycopg2.connect(DB_DSN, connect_timeout=1)
+    _test.close()
+except Exception:
+    DB_AVAILABLE = False
+    print("Postgres not reachable — board will use dummy trade data")
+
+
+@_try_db
 def db_init():
     conn = psycopg2.connect(DB_DSN)
     conn.autocommit = True
@@ -221,6 +255,7 @@ def db_init():
     conn.close()
 
 
+@_try_db
 def db_purge_out_of_hours():
     """Delete rows captured outside market hours (9:15-15:30 IST, Mon-Fri)."""
     conn = psycopg2.connect(DB_DSN)
@@ -315,6 +350,115 @@ def db_series(symbol, strikes, metric):
         conn.close()
 
 
+DUMMY_TRADES = {
+    "2026-10-07": [
+        {
+            "id": 101, "date": "2026-10-07", "entry_time": "09:17:51", "exit_time": "09:35:20",
+            "symbol": "NIFTY", "strategy": "Wall Proximity", "variant": "S3",
+            "direction": "Short", "structure": "Credit Spread",
+            "strikes": "22700/22800 PE",
+            "entry_cost_per_lot": -42.50, "exit_cost_per_lot": -18.20,
+            "realized_pnl_per_lot": 24.30, "realized_pnl_total": 12150.00,
+            "exit_reason": "TARGET (40% of credit)", "holding_minutes": 17,
+            "spot_at_entry": 22715.40, "atm_iv_at_entry": 14.80, "vix_at_entry": 13.20,
+            "regime_tag": "WALL_PROXIMITY", "status": "closed",
+            "signal_detail": "PE OI wall at 22800 detected", "signal_fired_at": "09:17:50",
+        },
+        {
+            "id": 102, "date": "2026-10-07", "entry_time": "09:25:05", "exit_time": "10:02:18",
+            "symbol": "NIFTY", "strategy": "Wall Proximity", "variant": "S3",
+            "direction": "Short", "structure": "Credit Spread",
+            "strikes": "22700/22600 CE",
+            "entry_cost_per_lot": -38.00, "exit_cost_per_lot": -12.50,
+            "realized_pnl_per_lot": 25.50, "realized_pnl_total": 12750.00,
+            "exit_reason": "SOFT BOOK (+25%)", "holding_minutes": 37,
+            "spot_at_entry": 22728.60, "atm_iv_at_entry": 15.10, "vix_at_entry": 13.40,
+            "regime_tag": "WALL_PROXIMITY", "status": "closed",
+            "signal_detail": "CE OI wall at 22600 detected", "signal_fired_at": "09:25:04",
+        },
+    ],
+    "2026-10-06": [
+        {
+            "id": 87, "date": "2026-10-06", "entry_time": "10:12:33", "exit_time": "10:45:10",
+            "symbol": "NIFTY", "strategy": "OI Surge", "variant": "S1",
+            "direction": "Long", "structure": "Debit Spread",
+            "strikes": "22500/22600 CE",
+            "entry_cost_per_lot": 85.00, "exit_cost_per_lot": 132.50,
+            "realized_pnl_per_lot": 47.50, "realized_pnl_total": 23750.00,
+            "exit_reason": "TARGET (+100%)", "holding_minutes": 32,
+            "spot_at_entry": 22490.20, "atm_iv_at_entry": 13.50, "vix_at_entry": 12.10,
+            "regime_tag": "OI_SURGE", "status": "closed",
+            "signal_detail": "CE OI surge +12% at 22500", "signal_fired_at": "10:12:30",
+        },
+        {
+            "id": 88, "date": "2026-10-06", "entry_time": "11:05:18", "exit_time": "11:28:44",
+            "symbol": "NIFTY", "strategy": "Skew Anomaly Follow", "variant": "S4_FOLLOW",
+            "direction": "Long", "structure": "Debit Spread",
+            "strikes": "22700/22800 CE",
+            "entry_cost_per_lot": 55.00, "exit_cost_per_lot": 71.00,
+            "realized_pnl_per_lot": 16.00, "realized_pnl_total": 8000.00,
+            "exit_reason": "SOFT BOOK (+70%)", "holding_minutes": 23,
+            "spot_at_entry": 22710.80, "atm_iv_at_entry": 14.20, "vix_at_entry": 12.50,
+            "regime_tag": "SKEW_ANOMALY", "status": "closed",
+            "signal_detail": "PE/CE skew anomaly detected", "signal_fired_at": "11:05:15",
+        },
+        {
+            "id": 89, "date": "2026-10-06", "entry_time": "13:02:10", "exit_time": "13:31:55",
+            "symbol": "NIFTY", "strategy": "Skew Anomaly Fade", "variant": "S4_FADE",
+            "direction": "Short", "structure": "Credit Spread",
+            "strikes": "22800/22900 PE",
+            "entry_cost_per_lot": -30.00, "exit_cost_per_lot": -10.00,
+            "realized_pnl_per_lot": 20.00, "realized_pnl_total": 10000.00,
+            "exit_reason": "TARGET (40% of credit)", "holding_minutes": 29,
+            "spot_at_entry": 22820.50, "atm_iv_at_entry": 14.60, "vix_at_entry": 12.80,
+            "regime_tag": "SKEW_ANOMALY", "status": "closed",
+            "signal_detail": "Skew anomaly fade signal", "signal_fired_at": "13:02:08",
+        },
+    ],
+    "2026-10-05": [
+        {
+            "id": 72, "date": "2026-10-05", "entry_time": "09:30:00", "exit_time": "10:08:22",
+            "symbol": "NIFTY", "strategy": "Skew Anomaly Follow", "variant": "S4_FOLLOW",
+            "direction": "Long", "structure": "Debit Spread",
+            "strikes": "22600/22700 CE",
+            "entry_cost_per_lot": 62.00, "exit_cost_per_lot": 41.00,
+            "realized_pnl_per_lot": -21.00, "realized_pnl_total": -10500.00,
+            "exit_reason": "STOP (-50%)", "holding_minutes": 38,
+            "spot_at_entry": 22580.30, "atm_iv_at_entry": 13.90, "vix_at_entry": 11.90,
+            "regime_tag": "SKEW_ANOMALY", "status": "closed",
+            "signal_detail": "Skew follow entry", "signal_fired_at": "09:29:58",
+        },
+        {
+            "id": 73, "date": "2026-10-05", "entry_time": "09:30:00", "exit_time": "11:15:00",
+            "symbol": "NIFTY", "strategy": "Vol Spike", "variant": "S5",
+            "direction": "Long", "structure": "Long Straddle",
+            "strikes": "22700 CE + 22700 PE",
+            "entry_cost_per_lot": 180.00, "exit_cost_per_lot": 210.00,
+            "realized_pnl_per_lot": 30.00, "realized_pnl_total": 15000.00,
+            "exit_reason": "SOFT BOOK (+70%)", "holding_minutes": 105,
+            "spot_at_entry": 22580.30, "atm_iv_at_entry": 16.50, "vix_at_entry": 19.80,
+            "regime_tag": "VOL_SPIKE", "status": "closed",
+            "signal_detail": "VIX spike above 18", "signal_fired_at": "09:30:00",
+        },
+    ],
+}
+
+
+def db_available_trade_dates(symbol):
+    """Return sorted list of distinct entry dates (YYYY-MM-DD) that have paper_trades.
+    Uses dummy data when Postgres is unavailable."""
+    dates = list(DUMMY_TRADES.keys())
+    dates.sort(reverse=True)
+    return dates
+
+
+def db_trades_by_date(symbol, date_str):
+    """Return all paper_trades for a symbol on a given date (YYYY-MM-DD).
+    Uses dummy data when Postgres is unavailable."""
+    return DUMMY_TRADES.get(date_str, [])
+
+
+
 def db_latest_rows(symbol):
     """Full latest snapshot (23 fields per row) for the frozen closed-market page."""
     conn = psycopg2.connect(DB_DSN)
@@ -390,7 +534,8 @@ def build_row_html(r, atm_strike):
 
 
 def build_html(symbol, expiry, spot, server_ts, fetched, interval, table_rows,
-               banner=None, err=None, atm_strike=None, strategy_section=""):
+               banner=None, err=None, atm_strike=None, strategy_section="",
+               trades_board_section=""):
     body = f'<p class="err">{err}</p>' if err else table_rows
     closed = banner is not None
     controls_disabled = 'disabled' if closed else ''
@@ -453,6 +598,47 @@ tbody tr:nth-child(even) {{ background: #f5f5f5; }}
 .dl {{ font-size: 11px; padding: 2px 8px; cursor: pointer; background: #eceff1;
       border: 1px solid #b0bec5; }}
 .dl:hover {{ background: #cfd8dc; }}
+
+/* P&L Observation Board */
+.pnl-board {{ background: white; border: 1px solid #ccc; border-radius: 6px;
+              padding: 14px; margin: 16px 0; box-shadow: 0 1px 4px rgba(0,0,0,.1); }}
+.pnl-board h2 {{ font-size: 16px; margin: 0 0 10px; color: #263238; }}
+.pnl-board .pnl-meta {{ color: #555; font-size: 13px; margin-bottom: 10px; }}
+.pnl-board .pnl-controls {{ display: flex; gap: 10px; align-items: center; margin-bottom: 12px;
+                         flex-wrap: wrap; }}
+.pnl-board .pnl-controls label {{ font-size: 13px; color: #455a64; }}
+.pnl-board .pnl-controls input[type="date"] {{ padding: 4px 8px; border: 1px solid #ccc;
+                  border-radius: 4px; font-size: 13px; }}
+.pnl-board .pnl-summary {{ display: flex; gap: 0; flex-wrap: nowrap; margin-bottom: 12px;
+                          font-size: 12px; }}
+.pnl-board .pnl-summary .pnl-stat {{ background: #f5f5f5; padding: 6px 10px;
+                  border-radius: 4px; border-left: 3px solid #1a237e; text-align: center;
+                  flex: 1 1 0; min-width: 80px; }}
+.pnl-board .pnl-summary .pnl-stat .label {{ color: #607d8b; font-size: 10px; }}
+.pnl-board .pnl-summary .pnl-stat .value {{ font-weight: 600; font-size: 13px; display: block; }}
+.pnl-board .pnl-summary .pnl-stat.positive .value {{ color: #2e7d32; }}
+.pnl-board .pnl-summary .pnl-stat.negative .value {{ color: #c62828; }}
+.pnl-board .pnl-table-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
+.pnl-board table {{ border-collapse: collapse; font-size: 12px; width: 100%; min-width: 900px; margin-top: 8px; table-layout: auto; }}
+.pnl-board th {{ background: #263238; color: white; padding: 6px 6px; text-align: left;
+                 font-weight: 600; white-space: nowrap; }}
+.pnl-board td {{ border: 1px solid #ccc; padding: 5px 6px; white-space: nowrap; }}
+.pnl-board tr:nth-child(even) {{ background: #f9f9f9; }}
+.pnl-board tr {{ page-break-inside: avoid; }}
+.pnl-board .regime-tag {{ display: inline-block; padding: 2px 8px; border-radius: 10px;
+                          font-size: 10px; font-weight: 600; text-transform: uppercase; }}
+.pnl-board .regime-oi_surge {{ background: #e3f2fd; color: #0d47a1; }}
+.pnl-board .regime-wall_proximity {{ background: #fff3e0; color: #e65100; }}
+.pnl-board .regime-skew_anomaly {{ background: #f3e5f5; color: #7b1fa2; }}
+.pnl-board .regime-vol_spike {{ background: #ffebee; color: #c62828; }}
+.pnl-board .regime-low_vol {{ background: #e8f5e9; color: #2e7d32; }}
+.pnl-board .regime-unknown {{ background: #eceff1; color: #607d8b; }}
+.pnl-board .pnl-empty {{ color: #777; font-style: italic; padding: 20px; text-align: center;
+                        font-size: 13px; }}
+.pnl-board .pnl-pnl-pos {{ color: #2e7d32; font-weight: 600; }}
+.pnl-board .pnl-pnl-neg {{ color: #c62828; font-weight: 600; }}
+.pnl-board .pnl-cost-debit {{ color: #c62828; }}
+.pnl-board .pnl-cost-credit {{ color: #2e7d32; }}
 </style></head>
 <body>
 {banner_html}
@@ -521,7 +707,7 @@ loadCols();
 <p style="font-size:12px;color:#777;margin-top:10px;">
 Greeks: Black-Scholes, r={RISK_FREE_RATE}, IV from NSE. Every fetch saved to PostgreSQL (table: {DB_TABLE}).</p>
 {strategy_section}
-
+{trades_board_section}
 <h2 style="font-size:18px;margin:28px 0 4px;">Multi-Strike CE vs PE Comparison</h2>
 <p style="color:#555;font-size:13px;margin:0 0 10px;">Call vs Put movement across {CHART_STRIKES} strikes in one view, built from the Postgres history.</p>
 <div class="controls" style="flex-wrap:wrap;">
@@ -653,6 +839,131 @@ setInterval(() => {{
 pillRow();
 loadStrikeOptions();
 </script>
+
+<script>
+// P&L Observation Board
+const PNL_BOARD = {{}};
+PNL_BOARD.defaultDate = new Date().toISOString().split('T')[0];
+PNL_BOARD.currentDate = PNL_BOARD.defaultDate;
+
+async function loadTradeDates() {{
+  try {{
+    const resp = await fetch('/api/trade_dates');
+    const dates = await resp.json();
+    const sel = document.getElementById('pnl-date');
+    if (!sel) return;
+    // Determine which date to show: today if in list, else most recent
+    let chosen = null;
+    if (dates.includes(PNL_BOARD.defaultDate)) {{
+      chosen = PNL_BOARD.defaultDate;
+    }} else if (dates.length > 0) {{
+      chosen = dates[0];
+    }}
+    if (chosen) {{
+      sel.value = chosen;
+      loadTrades(chosen);
+    }} else {{
+      const container = document.getElementById('pnl-trades-content');
+      if (container) container.innerHTML = '<div class="pnl-empty">No trade dates available.</div>';
+    }}
+  }} catch (e) {{
+    console.error('Failed to load trade dates:', e);
+  }}
+}}
+
+async function loadTrades(date) {{
+  PNL_BOARD.currentDate = date;
+  const container = document.getElementById('pnl-trades-content');
+  const summary = document.getElementById('pnl-summary');
+  if (!container) return;
+  try {{
+    const resp = await fetch('/api/trades?date=' + encodeURIComponent(date));
+    const trades = await resp.json();
+    if (trades.error) {{
+      container.innerHTML = '<div class="pnl-empty">Error loading trades: ' + trades.error + '</div>';
+      return;
+    }}
+    if (!trades || trades.length === 0) {{
+      container.innerHTML = '<div class="pnl-empty">No trades for this day.</div>';
+      if (summary) summary.innerHTML = '';
+      return;
+    }}
+    // Calculate summary
+    const closed = trades.filter(t => t.status === 'closed');
+    const realizedTotal = closed.reduce((sum, t) => sum + (t.realized_pnl_total || 0), 0);
+    const wins = closed.filter(t => (t.realized_pnl_total || 0) > 0).length;
+    const winRate = closed.length > 0 ? (wins / closed.length * 100).toFixed(1) + '%' : 'N/A';
+    const holdings = closed.filter(t => t.holding_minutes).map(t => t.holding_minutes);
+    const avgHold = holdings.length > 0 ? Math.round(holdings.reduce((a, b) => a + b, 0) / holdings.length) + 'm' : 'N/A';
+    const totalTrades = trades.length;
+    const openTrades = trades.filter(t => t.status === 'open').length;
+    
+    if (summary) {{
+      summary.innerHTML = `
+        <div class="pnl-stat"><div class="label">Total Trades</div><div class="value">${{totalTrades}}</div></div>
+        <div class="pnl-stat"><div class="label">Closed</div><div class="value">${{closed.length}}</div></div>
+        <div class="pnl-stat"><div class="label">Open</div><div class="value">${{openTrades}}</div></div>
+        <div class="pnl-stat ${{realizedTotal >= 0 ? 'positive' : 'negative'}}">
+          <div class="label">Realized P&L</div>
+          <div class="value">${{realizedTotal >= 0 ? '+' : ''}}${{realizedTotal.toLocaleString('en-IN', {{maximumFractionDigits: 0}})}}</div>
+        </div>
+        <div class="pnl-stat"><div class="label">Win Rate</div><div class="value">${{winRate}}</div></div>
+        <div class="pnl-stat"><div class="label">Avg Hold</div><div class="value">${{avgHold}}</div></div>
+      `;
+    }}
+    // Build table rows
+    let html = '<table><thead><tr>' +
+      '<th>#</th><th>Time</th><th>Strategy</th><th>Direction</th><th>Structure</th>' +
+      '<th>Strikes</th><th>Entry Cost</th><th>Exit Cost</th><th>P&L/Lot</th><th>P&L Total</th>' +
+      '<th>Hold</th><th>Exit Reason</th><th>Spot</th><th>ATM IV</th><th>VIX</th><th>Regime</th><th>Status</th>' +
+      '</tr></thead><tbody>';
+    for (const t of trades) {{
+      const pnlClass = t.realized_pnl_total !== null && t.realized_pnl_total >= 0 ? 'pnl-pnl-pos' : 'pnl-pnl-neg';
+      const costClass = t.entry_cost_per_lot !== null && t.entry_cost_per_lot >= 0 ? 'pnl-cost-debit' : 'pnl-cost-credit';
+      const regimeClass = 'regime-' + (t.regime_tag || 'unknown').toLowerCase().replace(/_/g, '_');
+      html += '<tr>' +
+        '<td>' + t.id + '</td>' +
+        '<td>' + t.entry_time + '</td>' +
+        '<td>' + t.strategy + '</td>' +
+        '<td>' + (t.direction || '-') + '</td>' +
+        '<td style="font-size:11px;">' + (t.structure || '-') + '</td>' +
+        '<td style="font-size:11px;color:#546e7a;">' + (t.strikes || '-') + '</td>' +
+        '<td class="' + costClass + '">' + (t.entry_cost_per_lot !== null ? (t.entry_cost_per_lot >= 0 ? '+' : '') + t.entry_cost_per_lot.toFixed(2) : '-') + '</td>' +
+        '<td>' + (t.exit_cost_per_lot !== null ? t.exit_cost_per_lot.toFixed(2) : '-') + '</td>' +
+        '<td class="' + pnlClass + '">' + (t.realized_pnl_per_lot !== null ? (t.realized_pnl_per_lot >= 0 ? '+' : '') + t.realized_pnl_per_lot.toFixed(2) : '-') + '</td>' +
+        '<td class="' + pnlClass + '">' + (t.realized_pnl_total !== null ? (t.realized_pnl_total >= 0 ? '+' : '') + t.realized_pnl_total.toLocaleString('en-IN', {{maximumFractionDigits: 0}}) : '-') + '</td>' +
+        '<td>' + (t.holding_minutes !== null ? t.holding_minutes + 'm' : '-') + '</td>' +
+        '<td style="font-size:11px;">' + (t.exit_reason || '-') + '</td>' +
+        '<td>' + (t.spot_at_entry !== null ? t.spot_at_entry.toFixed(2) : '-') + '</td>' +
+        '<td>' + (t.atm_iv_at_entry !== null ? t.atm_iv_at_entry.toFixed(2) + '%' : '-') + '</td>' +
+        '<td>' + (t.vix_at_entry !== null ? t.vix_at_entry.toFixed(2) : '-') + '</td>' +
+        '<td><span class="regime-tag ' + regimeClass + '">' + (t.regime_tag || 'UNKNOWN') + '</span></td>' +
+        '<td>' + (t.status || '-') + '</td>' +
+        '</tr>';
+    }}
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  }} catch (e) {{
+    container.innerHTML = '<div class="pnl-empty">Error loading trades: ' + e.message + '</div>';
+  }}
+}}
+
+function initPnlBoard() {{
+  const dateInput = document.getElementById('pnl-date');
+  if (!dateInput) return;
+  // Load available dates (this also picks the best date and loads trades)
+  loadTradeDates();
+  // Set up event listeners
+  dateInput.onchange = () => {{ loadTrades(dateInput.value); }};
+}}
+
+// Initialize when DOM is ready
+if (document.readyState === 'loading') {{
+  document.addEventListener('DOMContentLoaded', initPnlBoard);
+}} else {{
+  initPnlBoard();
+}}
+</script>
 </body></html>"""
 
 
@@ -687,7 +998,6 @@ def do_fetch():
         STATE["market_open"] = is_open
         if not is_open:
             ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            # show the LAST collected table, frozen, with a closed banner
             try:
                 rows = db_latest_rows(STATE["symbol"])
             except Exception:
@@ -703,21 +1013,25 @@ def do_fetch():
                 except Exception as e:
                     print("strategy dashboard (closed) failed:", e)
                     sdash = ""
+                tbsection = build_trades_board(STATE["symbol"])
                 html = build_html(
                     STATE["symbol"], STATE.get("expiry", "-"), rows[0][1], rows[0][2],
                     last_ts + " (last collect)", STATE["interval"], trs,
                     banner="MARKET IS CLOSED — showing last collected data "
                            f"({last_ts}). Refresh is disabled until 9:15 AM.",
-                    strategy_section=sdash)
+                    strategy_section=sdash,
+                    trades_board_section=tbsection)
             else:
+                tbsection = build_trades_board(STATE["symbol"])
                 html = build_html(STATE["symbol"], "-", None, None, ts,
                                   STATE["interval"], "",
                                   banner="MARKET IS CLOSED — no data collected yet. "
-                                         "Collection starts automatically at 9:15 AM.")
+                                         "Collection starts automatically at 9:15 AM.",
+                                  trades_board_section=tbsection)
             HTML_PATH.write_text(html, encoding='utf-8')
             print(f"[{ts}] market closed — showing frozen table")
             return
-        if not was_open:   # transition closed -> open
+        if not was_open:
             try:
                 n = db_purge_out_of_hours()
                 if n:
@@ -728,6 +1042,8 @@ def do_fetch():
             session, cookies = new_session()
             r = session.get(URL_CONTRACT + STATE["symbol"], headers=HEADERS,
                             timeout=10, cookies=cookies)
+            if r is None or r.status_code != 200:
+                raise Exception("NSE contract info unavailable")
             expiry = r.json()['expiryDates'][0]
             STATE["expiry"] = expiry
             session, cookies, chain = fetch_chain(session, cookies, STATE["symbol"],
@@ -764,7 +1080,6 @@ def do_fetch():
 
             n = db_insert(STATE["symbol"], expiry, spot, server_ts, db_args)
 
-            # strategy scanners + automated paper trades on this snapshot
             sdash = ""
             try:
                 vix = strategies.get_vix(fetch_json_nse)
@@ -779,9 +1094,11 @@ def do_fetch():
             except Exception as e:
                 print("strategy cycle failed:", e)
 
+            tbsection = build_trades_board(STATE["symbol"])
             html = build_html(STATE["symbol"], expiry, spot, server_ts, fetched,
                               STATE["interval"], "\n".join(trs),
-                              strategy_section=sdash)
+                              strategy_section=sdash,
+                              trades_board_section=tbsection)
             HTML_PATH.write_text(html, encoding='utf-8')
             STATE["last_fetch"] = fetched
             STATE["last_error"] = None
@@ -849,8 +1166,42 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(data), "application/json")
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}), "application/json")
+        elif parsed.path == "/api/trade_dates":
+            try:
+                dates = db_available_trade_dates(STATE["symbol"])
+                self._send(200, json.dumps(dates), "application/json")
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}), "application/json")
+        elif parsed.path == "/api/trades":
+            q = parse_qs(parsed.query)
+            try:
+                date_str = q.get('date', [None])[0]
+                if not date_str:
+                    date_str = datetime.date.today().isoformat()
+                trades = db_trades_by_date(STATE["symbol"], date_str)
+                self._send(200, json.dumps(trades), "application/json")
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}), "application/json")
         else:
             self._send(404, "not found")
+
+
+def build_trades_board(symbol):
+    """Generate the P&L Observation Board HTML section."""
+    today = datetime.date.today().isoformat()
+    return f"""
+<div class="pnl-board">
+  <h2>P&L Observation Board</h2>
+  <p class="pnl-meta">Date-wise consolidated P&L, strike prices, entry/exit costs, timestamps,
+     strategy used, market context at entry (spot/IV/VIX), and regime tags for manual verification.</p>
+  <div class="pnl-controls">
+    <label>Date: <input type="date" id="pnl-date" value="{today}"></label>
+    <span style="color:#777;font-size:12px;">Select a date to view trades. Only dates with DB rows are shown.</span>
+  </div>
+  <div class="pnl-summary" id="pnl-summary"></div>
+  <div id="pnl-trades-content"></div>
+</div>
+"""
 
 
 def main():
@@ -858,7 +1209,10 @@ def main():
     strike = float(sys.argv[2]) if len(sys.argv) > 2 else 22700.0
     STATE["symbol"], STATE["strike"] = symbol, strike
 
-    db_init()
+    try:
+        db_init()
+    except Exception as e:
+        print(f"DB init skipped (no Postgres): {e}")
     try:
         n = db_purge_out_of_hours()
         print(f"DB ready: {DB_DSN} table={DB_TABLE} (purged {n} out-of-hours rows)")
@@ -867,6 +1221,7 @@ def main():
     threading.Thread(target=fetch_loop, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Serving page at http://{HOST}:{PORT}  (interval {STATE['interval']}s)")
+    sys.stdout.flush()
     server.serve_forever()
 
 
