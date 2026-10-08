@@ -1,0 +1,28 @@
+# OCA project config — edit this file for non-default DB / server settings.
+# Environment variables always override what's written here (OCA_DB_DSN, etc.).
+#
+# Run `python -c "import yaml; ..."` or install PyYAML if this file is present
+# but the project can't import yaml — config.py will still fall back to env + defaults.
+#
+# Structure:
+#   db_dsn       — option-chain snapshot DB (NSE_Option_Chain_Analyzer's table lives here)
+#   strat_dsn    — strategy / signals / paper-trades DB (can be the same DB)
+#   snap_table   — Postgres table used for option-chain snapshots
+#   server_*     — live dashboard (option_chain_live.py) defaults
+
+db_dsn: "postgresql://postgres:postgres@localhost:5432/postgres"
+strat_dsn: "postgresql://postgres:postgres@localhost:5432/postgres"
+snap_table: "option_chain_snapshots"
+
+server_host: "127.0.0.1"
+server_port: 8899
+server_interval: 60
+
+# Per-symbol launch defaults used by the CLI entry points.
+symbols:
+  nifty:
+    symbol: "NIFTY"
+    strike: 22700
+  banknifty:
+    symbol: "BANKNIFTY"
+    strike: 49000

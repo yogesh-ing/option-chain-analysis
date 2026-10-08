@@ -18,3 +18,4 @@ Thumbs.db
 
 # Freebuff agent workspace (local-only, not for version control)
 .freebuff/
+agents/
